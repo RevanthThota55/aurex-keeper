@@ -1,0 +1,30 @@
+name: Heartbeat
+
+# GitHub silently disables `on: schedule` workflows in any repository with no
+# commit activity for 60 days. This job commits a timestamp once a month so the
+# keeper's schedule can never be switched off by inactivity. It is the ONLY
+# workflow here with write access, and the only thing it writes is .heartbeat.
+
+on:
+  schedule:
+    - cron: "17 3 1 * *" # 03:17 UTC on the 1st of every month
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Commit heartbeat
+        run: |
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .heartbeat
+          git config user.name "aurex-keeper-heartbeat"
+          git config user.email "actions@users.noreply.github.com"
+          git add .heartbeat
+          git commit -m "heartbeat: keep the schedule alive"
+          git push

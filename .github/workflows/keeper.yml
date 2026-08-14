@@ -1,0 +1,205 @@
+name: Aurex Keeper
+
+# Daily reward processing for the Aurex protocol on BSC MAINNET (chain 56):
+# drives ProtocolEngine.processDailyROI / processWeeklyReward for every
+# registered user (discovered from the on-chain registry — no eth_getLogs
+# dependency). Idempotent by construction: already-processed periods are
+# skipped, so overlapping runs are harmless.
+#
+# WHY THIS MATTERS MORE THAN IT LOOKS
+# ProtocolEngine._investmentDailyROI expires a stream on the WALL CLOCK
+# ((block.timestamp - startTime) / 1 days >= durationDays) but pays exactly ONE
+# day per call, with no catch-up or backfill. So every day this workflow fails
+# to run is a day of ROI every active member permanently loses. It is silent —
+# nothing errors and nothing reconciles later.
+#
+# That is why it runs three times a day rather than once. scheduler.canProcessDaily
+# gates the payout, so extra runs are no-ops and cost only gas. Two of the three
+# can fail without a member losing anything.
+#
+# THIS REPOSITORY IS PUBLIC — the security posture that makes that safe:
+#   * The only triggers are `schedule` and `workflow_dispatch`. No push/PR
+#     triggers exist, so outside contributions can never execute a workflow.
+#   * Third-party actions are pinned to commit SHAs, not floating tags.
+#   * GITHUB_TOKEN is read-only (`permissions` below).
+#   * KEEPER_PRIVATE_KEY is a DEDICATED low-value gas wallet held only as an
+#     Actions secret. The keeper is permissionless (processDailyROI has no auth
+#     modifier) so it needs no authority, only BNB, plus the delegated
+#     price-updater role. It is NOT the protocol owner key — never put that here.
+#   * Everything else in this repo (contract sources, addresses, keeper logic)
+#     is already public via BscScan verification and on-chain state.
+
+on:
+  schedule:
+    - cron: "0 2 * * *" # 02:00 UTC
+    - cron: "0 10 * * *" # 10:00 UTC
+    - cron: "0 18 * * *" # 18:00 UTC
+  workflow_dispatch: {} # manual runs from the Actions tab
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aurex-keeper
+  cancel-in-progress: false # runs are idempotent; queue rather than kill
+
+jobs:
+  keeper:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RPC_URL: https://bsc-dataseed.binance.org
+      PROTOCOL_ENGINE_ADDRESS: "0xD9cFD169dEC5C7B837c54D3e01Befe4CE006C226"
+      PROTOCOL_SCHEDULER_ADDRESS: "0x237f93A93503AcFFfAfA335AB4edFD070E8C1499"
+      PROTOCOL_CONFIG_ADDRESS: "0xb891cfE5b6555Ef7185E72087284b70Df6b8d325"
+      INVESTMENT_MANAGER_ADDRESS: "0x0e7b783D94A77A5f9aD1429d7d889e345d40C4bA"
+      DEPLOYMENT_BLOCK: "114993051"
+      ARX_TOKEN_ADDRESS: "0xD198ab36AA85d02056D04De7F400FDfc2bC73770"
+      ARX_USDT_PAIR_ADDRESS: "0x9376192A5de981fE0d7e8c8dFB7beA1abECAbbF3"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
+
+      - name: Resolve keeper wallet
+        env:
+          KEEPER_PRIVATE_KEY: ${{ secrets.KEEPER_PRIVATE_KEY }}
+        run: |
+          if [ -z "$KEEPER_PRIVATE_KEY" ]; then
+            echo "::error::KEEPER_PRIVATE_KEY secret is not set. Add it under"
+            echo "Settings > Secrets and variables > Actions. It must be a dedicated"
+            echo "gas-only wallet funded with BNB, NOT the protocol owner key."
+            exit 1
+          fi
+          # Derived rather than hardcoded, so rotating the key cannot leave the
+          # balance check watching a stale address.
+          KEEPER_ADDR=$(cast wallet address --private-key "$KEEPER_PRIVATE_KEY")
+          echo "KEEPER_ADDR=$KEEPER_ADDR" >> "$GITHUB_ENV"
+          echo "Keeper wallet: $KEEPER_ADDR"
+
+      - name: Pre-flight gas check
+        run: |
+          BAL=$(cast balance "$KEEPER_ADDR" --rpc-url "$RPC_URL")
+          echo "Keeper gas: $BAL wei"
+          if [ "$BAL" = "0" ]; then
+            echo "::error::Keeper wallet $KEEPER_ADDR has ZERO BNB. Members lose a"
+            echo "day of ROI for every run that cannot broadcast. Fund it now."
+            exit 1
+          fi
+
+      # Reads the ARX/USDT price straight from the PancakeSwap pair and hands it to the keeper,
+      # which pushes it on-chain before processing any ROI. ProtocolEngine converts each day's
+      # USDT-denominated ROI at the LIVE price, so a stale price overpays (price lagging below
+      # market) or underpays (lagging above) every member, every day.
+      #
+      # An explicit ARX_PRICE_USDT repository variable still overrides the pool reading, which
+      # is the escape hatch if the pool ever needs to be ignored.
+      #
+      # Requires: the keeper wallet is the configured arxPriceUpdater, and (for the reading to
+      # land unmodified) arxPriceMaxDeviationBps is 0. With a non-zero bound the keeper clamps
+      # to the largest permitted step instead, and walks toward the pool price over several runs.
+      #
+      # NOTE ON POOL DEPTH: this feed is only as trustworthy as the pool is deep. A thin pool can
+      # be moved a long way for very little money, and with the deviation bound at 0 that move is
+      # taken at face value. Keep the pool deep enough that manipulating it costs more than the
+      # ROI it would distort.
+      - name: Read live ARX price from the pool
+        run: |
+          set -euo pipefail
+
+          # An explicit repository variable wins over the pool, so there is always a manual override.
+          if [ -n "${{ vars.ARX_PRICE_USDT }}" ]; then
+            echo "ARX_PRICE_USDT=${{ vars.ARX_PRICE_USDT }}" >> "$GITHUB_ENV"
+            echo "Price source: ARX_PRICE_USDT repository variable (override) = ${{ vars.ARX_PRICE_USDT }}"
+            exit 0
+          fi
+
+          # Token order in a pair is by address sort, not by which token you care about — read it
+          # rather than assuming, so a redeployed pair cannot silently invert the price.
+          TOKEN0=$(cast call "$ARX_USDT_PAIR_ADDRESS" 'token0()(address)' --rpc-url "$RPC_URL")
+
+          RES=$(cast call "$ARX_USDT_PAIR_ADDRESS" 'getReserves()(uint112,uint112,uint32)' --rpc-url "$RPC_URL")
+          R0=$(echo "$RES" | sed -n '1p' | cut -d' ' -f1)   # cast may append a bracketed exponent form
+          R1=$(echo "$RES" | sed -n '2p' | cut -d' ' -f1)
+
+          if [ "${TOKEN0,,}" = "${ARX_TOKEN_ADDRESS,,}" ]; then
+            ARX_RES="$R0"; USDT_RES="$R1"
+          else
+            ARX_RES="$R1"; USDT_RES="$R0"
+          fi
+          echo "Pool reserves — ARX: $ARX_RES  USDT: $USDT_RES"
+
+          # An empty or half-empty pool has no price. Skipping leaves the on-chain price untouched,
+          # which is the safe direction: a zero would revert updateArxPrice and fail the whole run.
+          if [ "$ARX_RES" = "0" ] || [ "$USDT_RES" = "0" ]; then
+            echo "::warning::Pool reserve is zero — leaving the on-chain ARX price unchanged."
+            exit 0
+          fi
+
+          # Price in USDT base units per whole ARX. python3 for arbitrary precision: these
+          # intermediates exceed 64 bits and would silently wrap in shell arithmetic.
+          PRICE=$(python3 -c "print(($USDT_RES * 10**18) // $ARX_RES)")
+
+          if [ "$PRICE" = "0" ]; then
+            echo "::warning::Computed pool price rounded to zero — leaving the on-chain price unchanged."
+            exit 0
+          fi
+
+          echo "ARX_PRICE_USDT=$PRICE" >> "$GITHUB_ENV"
+          echo "Price source: live pool = $PRICE (≈ $(python3 -c "print($PRICE / 10**18)") USDT per ARX)"
+
+      - name: Run keeper
+        run: |
+          # Unset rather than empty: the script parses this as a uint, and an empty string is not
+          # parseable. Unset makes its envOr default apply, leaving the on-chain price alone.
+          if [ -z "${ARX_PRICE_USDT:-}" ]; then unset ARX_PRICE_USDT; fi
+
+          # Process the network in slices. Public BSC RPCs prune state within seconds, so a
+          # whole-network run's simulation outlives its forked block ("missing trie node") once
+          # the user count grows past roughly forty. Each slice is short enough to finish, and
+          # runs are idempotent, so the loop is a safe full sweep.
+          TOTAL=$(cast call "$INVESTMENT_MANAGER_ADDRESS" 'registeredUserCount()(uint256)' --rpc-url "$RPC_URL")
+          TOTAL=${TOTAL%% *}   # cast may append a bracketed exponent form
+          echo "Registered users: $TOTAL"
+
+          if [ "$TOTAL" = "0" ]; then
+            echo "No registered users yet — nothing to process."
+            exit 0
+          fi
+
+          BATCH=10
+          FAILED=0
+          for (( START=0; START<TOTAL; START+=BATCH )); do
+            echo "::group::Keeper slice $START"
+            OK=0
+            for ATTEMPT in 1 2 3; do
+              # Gas price is estimated rather than pinned: BSC mainnet sits near
+              # 0.05 gwei but a pinned figure either overpays 60x or leaves the
+              # transaction stuck when the network moves.
+              if KEEPER_USER_START=$START KEEPER_USER_COUNT=$BATCH forge script script/Keeper.s.sol:Keeper \
+                   --rpc-url "$RPC_URL" --broadcast \
+                   --private-key "${{ secrets.KEEPER_PRIVATE_KEY }}" \
+                   --legacy --slow; then
+                OK=1; break
+              fi
+              echo "slice $START attempt $ATTEMPT failed; retrying"
+              sleep 10
+            done
+            [ "$OK" = "1" ] || { echo "::warning::Keeper slice $START failed after 3 attempts"; FAILED=1; }
+            echo "::endgroup::"
+          done
+
+          # A partial sweep must not report success — the untouched users got no rewards today.
+          [ "$FAILED" = "0" ] || exit 1
+
+      - name: Keeper wallet gas check
+        if: always()
+        run: |
+          BAL=$(cast balance "$KEEPER_ADDR" --rpc-url "$RPC_URL")
+          echo "Keeper gas remaining: $BAL wei"
+          # Warn loudly in the job summary when the tank runs low (< 0.005 BNB).
+          if [ "$(echo "$BAL < 5000000000000000" | bc)" = "1" ]; then
+            echo "::warning::Keeper wallet $KEEPER_ADDR is low on BNB — top it up"
+          fi

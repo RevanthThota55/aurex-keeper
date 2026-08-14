@@ -1,0 +1,26 @@
+# Foundry configuration for the Aurex keeper runner.
+# Compiler settings mirror the main protocol repo exactly so the sources
+# here compile to the same artifacts they were deployed from.
+
+[profile.default]
+    src = "contracts"
+    script = "script"
+    libs = ["lib"]
+    out = "out"
+    cache = true
+    cache_path = "cache"
+
+    solc = "0.8.30"
+    auto_detect_solc = false
+    evm_version = "paris"
+
+    optimizer = true
+    optimizer_runs = 200
+    via_ir = false
+
+    bytecode_hash = "none"
+    cbor_metadata = false
+
+    verbosity = 2
+
+    ffi = false
