@@ -9,7 +9,8 @@ This repository contains only what the scheduled runner needs:
 - `script/Keeper.s.sol` — the keeper: refreshes the ARX/USDT conversion price from the
   PancakeSwap pair and calls `processDailyROI` / `processWeeklyReward` for every
   registered user.
-- `.github/workflows/keeper.yml` — the schedule (02:00 / 10:00 / 18:00 UTC).
+- `.github/workflows/keeper.yml` — the schedule (23:50 / 10:00 / 18:00 UTC; the
+  23:50 run is the daily payout, the others are idempotent safety re-runs).
 
 ## Security model
 

@@ -31,9 +31,14 @@ name: Aurex Keeper
 
 on:
   schedule:
-    - cron: "0 2 * * *" # 02:00 UTC
-    - cron: "0 10 * * *" # 10:00 UTC
-    - cron: "0 18 * * *" # 18:00 UTC
+    # The protocol day rolls at 20:31 UTC, so 23:50 UTC is the first run of each
+    # new day — it does the payout. Scheduled at :50 rather than 00:00 because
+    # midnight UTC is GitHub's most congested cron slot: with the usual queue
+    # delay this lands members' ARX at ~05:30 IST, which is the operator's
+    # chosen payout time. The other two runs are same-day safety re-runs.
+    - cron: "50 23 * * *" # 23:50 UTC ≈ 05:20-05:30 IST payout run
+    - cron: "0 10 * * *" # 10:00 UTC safety
+    - cron: "0 18 * * *" # 18:00 UTC safety
   workflow_dispatch: {} # manual runs from the Actions tab
 
 permissions:
