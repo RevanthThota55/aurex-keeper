@@ -53,7 +53,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      RPC_URL: https://bsc-dataseed.binance.org
       PROTOCOL_ENGINE_ADDRESS: "0xD9cFD169dEC5C7B837c54D3e01Befe4CE006C226"
       PROTOCOL_SCHEDULER_ADDRESS: "0x237f93A93503AcFFfAfA335AB4edFD070E8C1499"
       PROTOCOL_CONFIG_ADDRESS: "0xb891cfE5b6555Ef7185E72087284b70Df6b8d325"
@@ -67,6 +66,34 @@ jobs:
           submodules: recursive
 
       - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
+
+      # A single hardcoded endpoint was the run's biggest remaining single point
+      # of failure. Probe a candidate list and use the first one that answers;
+      # RPC_FALLBACK_URL is a secret because keyed endpoints must never appear
+      # in a public workflow file or its logs.
+      - name: Select RPC endpoint
+        env:
+          RPC_FALLBACK_URL: ${{ secrets.RPC_FALLBACK_URL }}
+        run: |
+          set -uo pipefail
+          CANDIDATES=(
+            "https://bsc-dataseed.binance.org"
+            "https://bsc-dataseed1.defibit.io"
+            "https://bsc-dataseed1.ninicoin.io"
+          )
+          [ -n "${RPC_FALLBACK_URL:-}" ] && CANDIDATES+=("$RPC_FALLBACK_URL")
+          for RPC in "${CANDIDATES[@]}"; do
+            if BLOCK=$(timeout 10 cast block-number --rpc-url "$RPC" 2>/dev/null) && [ -n "$BLOCK" ]; then
+              echo "RPC_URL=$RPC" >> "$GITHUB_ENV"
+              # Redact keyed URLs in everything the runner prints from here on.
+              [ "$RPC" = "${RPC_FALLBACK_URL:-}" ] && echo "::add-mask::$RPC"
+              echo "Selected RPC ($([ "$RPC" = "${RPC_FALLBACK_URL:-}" ] && echo 'fallback secret' || echo "$RPC")) at block $BLOCK"
+              exit 0
+            fi
+            echo "RPC candidate unresponsive, trying next"
+          done
+          echo "::error::No RPC endpoint answered — cannot run the keeper."
+          exit 1
 
       - name: Resolve keeper wallet
         env:
