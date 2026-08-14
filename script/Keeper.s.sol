@@ -70,7 +70,10 @@ contract Keeper is Script {
         uint256 fromBlock = vm.envOr("DEPLOYMENT_BLOCK", uint256(0));
         require(fromBlock != 0, "Keeper: set DEPLOYMENT_BLOCK (log-scan floor); scanning from genesis is not viable");
 
-        address[] memory users = _slice(_discoverUsers(investmentManager, fromBlock));
+        // Slicing happens inside discovery (registry path fetches only the window;
+        // the log-scan fallback applies _slice itself) — never wrap it again here,
+        // or sliced runs would double-narrow and silently skip members.
+        address[] memory users = _discoverUsers(investmentManager, fromBlock);
         console2.log("Keeper: users to process this run:", users.length);
 
         bool weeklyEnabled = config.weeklyRewardEnabled();
@@ -179,14 +182,27 @@ contract Keeper is Script {
         InvestmentManager manager = InvestmentManager(investmentManager);
         try manager.registeredUserCount() returns (uint256 count) {
             if (count != 0) {
-                users = new address[](count);
-                for (uint256 i = 0; i < count; i++) {
-                    users[i] = manager.userAt(i);
+                // Fetch ONLY this run's slice from the registry. The previous shape read
+                // the whole list and narrowed afterwards, which made a sliced sweep cost
+                // O(users^2 / batch) RPC calls across its slices — ruinous at four digits
+                // of members and the reason big networks tripped free-RPC rate limits.
+                uint256 start = vm.envOr("KEEPER_USER_START", uint256(0));
+                uint256 want = vm.envOr("KEEPER_USER_COUNT", uint256(0));
+                if (start >= count) return new address[](0);
+                uint256 end = want == 0 ? count : start + want;
+                if (end > count) end = count;
+
+                users = new address[](end - start);
+                for (uint256 i = start; i < end; i++) {
+                    users[i - start] = manager.userAt(i);
+                }
+                if (start != 0 || end != count) {
+                    console2.log("Keeper: slice", start, "..", end - 1);
                 }
                 return users;
             }
         } catch {} // registry not present on this deployment — fall through to the log scan
-        return _discoverUsersFromLogs(investmentManager, fromBlock);
+        return _slice(_discoverUsersFromLogs(investmentManager, fromBlock));
     }
 
     /// @dev Scans `UserRegistered` logs in chunks and returns the registered users.

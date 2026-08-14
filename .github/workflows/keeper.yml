@@ -51,7 +51,10 @@ concurrency:
 jobs:
   keeper:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Generous ceiling: a 1,000-member sweep is ~100 slices of sequential
+    # transactions and legitimately takes over an hour. Public-repo minutes are
+    # free, so headroom costs nothing; the cap only exists to kill a true hang.
+    timeout-minutes: 180
     env:
       PROTOCOL_ENGINE_ADDRESS: "0xD9cFD169dEC5C7B837c54D3e01Befe4CE006C226"
       PROTOCOL_SCHEDULER_ADDRESS: "0x237f93A93503AcFFfAfA335AB4edFD070E8C1499"
@@ -201,7 +204,12 @@ jobs:
             exit 0
           fi
 
-          BATCH=10
+          # Slice size is bounded by how long the RPC node retains recent state
+          # during simulation, not by runner hardware. 10 is safe on free public
+          # endpoints; with a dedicated/paid endpoint, raise it via the
+          # KEEPER_BATCH repository variable — no commit needed.
+          BATCH="${{ vars.KEEPER_BATCH }}"
+          BATCH="${BATCH:-10}"
           FAILED=0
           for (( START=0; START<TOTAL; START+=BATCH )); do
             echo "::group::Keeper slice $START"
